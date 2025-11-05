@@ -7,12 +7,21 @@ import (
 	"time"
 )
 
+// PairParser resolves a trading symbol (e.g. "BTC/USDT") into its base
+// and quote assets. Implementations should return ok=false if they cannot
+// derive a valid pair so callers can surface an error.
+type PairParser func(symbol string) (baseAsset, quoteAsset string, ok bool)
+
+// Option configures a Portfolio instance.
+type Option func(*Portfolio)
+
 // Portfolio manages the trading portfolio
 type Portfolio struct {
 	balances     map[string]float64
 	positions    map[string]Position
 	transactions []Transaction
 	mu           sync.RWMutex
+	pairParser   PairParser
 }
 
 // Position represents a trading position
@@ -40,11 +49,52 @@ type Transaction struct {
 
 // NewPortfolio creates a new portfolio
 func NewPortfolio() *Portfolio {
-	return &Portfolio{
+	return NewPortfolioWithOptions()
+}
+
+// NewPortfolioWithOptions creates a portfolio configured by the supplied options.
+func NewPortfolioWithOptions(options ...Option) *Portfolio {
+	p := &Portfolio{
 		balances:     make(map[string]float64),
 		positions:    make(map[string]Position),
 		transactions: []Transaction{},
+		pairParser:   defaultPairParser,
 	}
+
+	for _, opt := range options {
+		opt(p)
+	}
+
+	if p.pairParser == nil {
+		p.pairParser = defaultPairParser
+	}
+
+	return p
+}
+
+// WithPairParser overrides the default BASE/QUOTE parser used for balance updates.
+func WithPairParser(parser PairParser) Option {
+	return func(p *Portfolio) {
+		p.pairParser = parser
+	}
+}
+
+// BalanceSnapshot is a DTO representing a copy of an asset balance.
+type BalanceSnapshot struct {
+	Asset  string  `json:"asset"`
+	Amount float64 `json:"amount"`
+}
+
+// PositionSnapshot is a DTO mirroring Position but intended for serialization.
+type PositionSnapshot struct {
+	Symbol        string    `json:"symbol"`
+	EntryPrice    float64   `json:"entryPrice"`
+	CurrentPrice  float64   `json:"currentPrice"`
+	Quantity      float64   `json:"quantity"`
+	OpenTime      time.Time `json:"openTime"`
+	LastUpdated   time.Time `json:"lastUpdated"`
+	RealizedPnL   float64   `json:"realizedPnl"`
+	UnrealizedPnL float64   `json:"unrealizedPnl"`
 }
 
 // GetBalance returns the balance of an asset
@@ -93,13 +143,24 @@ func (p *Portfolio) ClosePosition(symbol string) error {
 	return nil
 }
 
-// AddTransaction adds a transaction to the portfolio
-func (p *Portfolio) AddTransaction(transaction Transaction) {
+// AddTransaction adds a transaction to the portfolio and updates balances/positions.
+func (p *Portfolio) AddTransaction(transaction Transaction) error {
+	parser := p.pairParser
+	if parser == nil {
+		parser = defaultPairParser
+		p.pairParser = parser
+	}
+
+	baseAsset, quoteAsset, hasPair := parser(transaction.Symbol)
+	requiresBalances := transaction.Type == "buy" || transaction.Type == "sell"
+	if requiresBalances && !hasPair {
+		return fmt.Errorf("cannot update balances for %s: unrecognized symbol format", transaction.Symbol)
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.transactions = append(p.transactions, transaction)
-	baseAsset, quoteAsset, hasPair := splitSymbol(transaction.Symbol)
 
 	// Update balances and positions based on the transaction
 	// This is a simplified implementation
@@ -166,6 +227,8 @@ func (p *Portfolio) AddTransaction(transaction Transaction) {
 			p.balances[quoteAsset] += transaction.Quantity*transaction.Price - transaction.Fee
 		}
 	}
+
+	return nil
 }
 
 // GetTransactions returns all transactions
@@ -225,8 +288,46 @@ func (p *Portfolio) GetAllPositions() map[string]Position {
 	return positions
 }
 
-// splitSymbol extracts base and quote assets from a symbol formatted as BASE/QUOTE.
-func splitSymbol(symbol string) (string, string, bool) {
+// BalancesSnapshot returns a slice of balances safe for serialization.
+func (p *Portfolio) BalancesSnapshot() []BalanceSnapshot {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	snapshots := make([]BalanceSnapshot, 0, len(p.balances))
+	for asset, amount := range p.balances {
+		snapshots = append(snapshots, BalanceSnapshot{
+			Asset:  asset,
+			Amount: amount,
+		})
+	}
+
+	return snapshots
+}
+
+// PositionsSnapshot returns a slice of Position DTOs safe for serialization.
+func (p *Portfolio) PositionsSnapshot() []PositionSnapshot {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	snapshots := make([]PositionSnapshot, 0, len(p.positions))
+	for _, position := range p.positions {
+		snapshots = append(snapshots, PositionSnapshot{
+			Symbol:        position.Symbol,
+			EntryPrice:    position.EntryPrice,
+			CurrentPrice:  position.CurrentPrice,
+			Quantity:      position.Quantity,
+			OpenTime:      position.OpenTime,
+			LastUpdated:   position.LastUpdated,
+			RealizedPnL:   position.RealizedPnL,
+			UnrealizedPnL: position.UnrealizedPnL,
+		})
+	}
+
+	return snapshots
+}
+
+// defaultPairParser extracts base and quote assets from a symbol formatted as BASE/QUOTE.
+func defaultPairParser(symbol string) (string, string, bool) {
 	base, quote, ok := strings.Cut(symbol, "/")
 	if !ok || base == "" || quote == "" {
 		return "", "", false
