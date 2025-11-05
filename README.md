@@ -6,9 +6,11 @@
 - Gorilla-safe data structure: wraps every balance/position mutation with `sync.RWMutex` to keep concurrent readers/writers happy.
 - Basic position accounting: create, update, close, and inspect positions with realized/unrealized PnL fields for downstream consumers.
 - Transaction ledger: append-only slice that can be copied out for reporting or persistence layers.
-- Balance/position DTO snapshots: `BalancesSnapshot` and `PositionsSnapshot` hand you serialization-ready slices without exposing internal maps.
+- Balance/position DTO snapshots: `Snapshot`, `BalancesSnapshot`, and `PositionsSnapshot` hand you serialization-ready copies without exposing internal maps.
 - Configurable pair parsing: pass `WithPairParser` to `NewPortfolioWithOptions` to support venues that do not use the default `BASE/QUOTE` slash format.
-- Context-aware accounting: `AddTransaction` returns useful errors when a transaction cannot be reconciled into balances.
+- Fee schedules: describe fees per symbol/base/quote (or default) once and let the portfolio apply them for every transaction.
+- Persistence hooks: plug in JSON, BoltDB, or SQLite stores via `WithSnapshotStore` to automatically persist and rehydrate state between restarts.
+- Streaming events: `Subscribe` yields a channel that receives balance/position/transaction events for real-time UIs or alerting.
 - Portfolio valuation helper: converts every asset to a chosen quote asset using caller-provided price data and sums the result.
 
 ## Getting Started
@@ -26,6 +28,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -41,10 +44,22 @@ func main() {
 		return parts[0], parts[1], true
 	}
 
+	feeSchedule := &goportfolio.FeeSchedule{
+		Symbols: map[string]float64{
+			"CFX/USDT": 1, // flat fee applied automatically
+		},
+	}
+
+	store := goportfolio.NewJSONFileStore("portfolio.json")
+
 	p := goportfolio.NewPortfolioWithOptions(
 		goportfolio.WithPairParser(customParser),
+		goportfolio.WithFeeSchedule(feeSchedule),
+		goportfolio.WithSnapshotStore(store),
 	)
-	p.SetBalance("USDT", 1000)
+	if err := p.SetBalance("USDT", 1000); err != nil {
+		log.Fatalf("seed balance: %v", err)
+	}
 
 	if err := p.AddTransaction(goportfolio.Transaction{
 		ID:        "tx1",
@@ -52,10 +67,9 @@ func main() {
 		Type:      "buy",
 		Quantity:  10,
 		Price:     2.5,
-		Fee:       1,
 		Timestamp: time.Now(),
 	}); err != nil {
-		panic(err)
+		log.Fatalf("add transaction: %v", err)
 	}
 
 	priceBook := map[string]float64{
@@ -65,6 +79,24 @@ func main() {
 
 	fmt.Printf("Balances DTOs: %+v\n", p.BalancesSnapshot())
 	fmt.Printf("Positions DTOs: %+v\n", p.PositionsSnapshot())
+
+	if err := p.LoadFromStore(); err != nil {
+		log.Fatalf("rehydrate: %v", err)
+	}
+
+	events, cancel := p.Subscribe(10)
+	defer cancel()
+
+	if err := p.SetBalance("USDT", 750); err != nil {
+		log.Fatalf("update balance: %v", err)
+	}
+
+	select {
+	case evt := <-events:
+		fmt.Printf("Event: %s %#v\n", evt.Type, evt.Balance)
+	case <-time.After(2 * time.Second):
+		fmt.Println("no events received")
+	}
 }
 ```
 
@@ -76,9 +108,9 @@ go test ./...
 
 ## Roadmap Ideas
 These are intentionally out of scope for the current release, but would make natural extensions:
-1. Optional persistence hooks (JSON, BoltDB, sqlite) fed by the DTO snapshots.
-2. Fee configuration per asset/venue instead of per-transaction overrides.
-3. Streaming callbacks or channels that notify listeners on portfolio mutations.
+1. Risk controls (max exposure, daily loss limits) baked into `AddTransaction` to stop trades that exceed policy.
+2. Snapshot diffs so downstream systems can subscribe to compact change-sets instead of full DTO slices.
+3. Built-in persistence migrations to evolve stored snapshots without forcing manual wipes.
 
 ## License
 MIT-0
