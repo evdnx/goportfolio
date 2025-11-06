@@ -112,8 +112,7 @@ go test ./...
 
 ## Roadmap Ideas
 These are intentionally out of scope for the current release, but would make natural extensions:
-1. Risk controls (max exposure, daily loss limits) baked into `AddTransaction` to stop trades that exceed policy.
-2. Built-in persistence migrations to evolve stored snapshots without forcing manual wipes.
+- Built-in persistence migrations to evolve stored snapshots without forcing manual wipes.
 
 ## License
 MIT-0

@@ -71,6 +71,107 @@ func TestAddTransactionWithInvalidSymbolDoesNotUpdateBalances(t *testing.T) {
 	}
 }
 
+func TestAddTransactionRespectsMaxExposureLimit(t *testing.T) {
+	policy := &RiskPolicy{
+		MaxExposureBySymbol: map[string]float64{
+			"BTC/USDT": 5,
+		},
+	}
+	p := NewPortfolioWithOptions(WithRiskPolicy(policy))
+	if err := p.SetBalance("USDT", 100000); err != nil {
+		t.Fatalf("set balance failed: %v", err)
+	}
+
+	allowed := Transaction{
+		ID:        "btc-1",
+		Symbol:    "BTC/USDT",
+		Type:      "buy",
+		Quantity:  3,
+		Price:     25000,
+		Timestamp: time.Now(),
+	}
+	if err := p.AddTransaction(allowed); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	rejected := Transaction{
+		ID:        "btc-2",
+		Symbol:    "BTC/USDT",
+		Type:      "buy",
+		Quantity:  3,
+		Price:     26000,
+		Timestamp: time.Now().Add(time.Minute),
+	}
+	err := p.AddTransaction(rejected)
+	if err == nil {
+		t.Fatalf("expected exposure error, got nil")
+	}
+	if !strings.Contains(err.Error(), "exposure") {
+		t.Fatalf("expected exposure context in error: %v", err)
+	}
+	if got := len(p.GetTransactions()); got != 1 {
+		t.Fatalf("exposure rejection should not record transaction, got %d transactions", got)
+	}
+}
+
+func TestAddTransactionRespectsDailyLossLimit(t *testing.T) {
+	policy := &RiskPolicy{
+		DailyLossLimit: 50,
+	}
+	p := NewPortfolioWithOptions(WithRiskPolicy(policy))
+	if err := p.SetBalance("USD", 1000); err != nil {
+		t.Fatalf("set balance failed: %v", err)
+	}
+
+	now := time.Now()
+	open := Transaction{
+		ID:        "eth-open",
+		Symbol:    "ETH/USD",
+		Type:      "buy",
+		Quantity:  4,
+		Price:     100,
+		Timestamp: now,
+	}
+	if err := p.AddTransaction(open); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	firstLoss := Transaction{
+		ID:        "eth-loss-1",
+		Symbol:    "ETH/USD",
+		Type:      "sell",
+		Quantity:  1,
+		Price:     80,
+		Timestamp: now.Add(time.Minute),
+	}
+	if err := p.AddTransaction(firstLoss); err != nil {
+		t.Fatalf("unexpected error closing small loss: %v", err)
+	}
+
+	secondLoss := Transaction{
+		ID:        "eth-loss-2",
+		Symbol:    "ETH/USD",
+		Type:      "sell",
+		Quantity:  1,
+		Price:     30,
+		Timestamp: now.Add(2 * time.Minute),
+	}
+	err := p.AddTransaction(secondLoss)
+	if err == nil {
+		t.Fatalf("expected daily loss limit error")
+	}
+	if !strings.Contains(err.Error(), "daily losses") {
+		t.Fatalf("expected daily loss context in error: %v", err)
+	}
+	pos, ok := p.GetPosition("ETH/USD")
+	if !ok {
+		t.Fatalf("position should remain after rejected trade")
+	}
+	if pos.Quantity != 3 {
+		t.Fatalf("position quantity changed after rejection: got %v want 3", pos.Quantity)
+	}
+}
+
 func TestWithPairParserAllowsCustomFormats(t *testing.T) {
 	parser := func(symbol string) (string, string, bool) {
 		parts := strings.Split(symbol, "-")

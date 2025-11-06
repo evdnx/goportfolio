@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -50,6 +51,32 @@ func (fs *FeeSchedule) clone() *FeeSchedule {
 		Quotes:     copyMap(fs.Quotes),
 		Default:    fs.Default,
 		HasDefault: fs.HasDefault,
+	}
+}
+
+// RiskPolicy defines the exposure and loss limits enforced before recording trades.
+type RiskPolicy struct {
+	MaxExposure         float64
+	MaxExposureBySymbol map[string]float64
+	DailyLossLimit      float64
+}
+
+// clone returns a deep copy so caller mutations do not affect portfolio state.
+func (rp *RiskPolicy) clone() *RiskPolicy {
+	if rp == nil {
+		return nil
+	}
+	var bySymbol map[string]float64
+	if len(rp.MaxExposureBySymbol) > 0 {
+		bySymbol = make(map[string]float64, len(rp.MaxExposureBySymbol))
+		for symbol, limit := range rp.MaxExposureBySymbol {
+			bySymbol[symbol] = limit
+		}
+	}
+	return &RiskPolicy{
+		MaxExposure:         rp.MaxExposure,
+		MaxExposureBySymbol: bySymbol,
+		DailyLossLimit:      rp.DailyLossLimit,
 	}
 }
 
@@ -146,11 +173,13 @@ type Portfolio struct {
 	mu               sync.RWMutex
 	pairParser       PairParser
 	feeSchedule      *FeeSchedule
+	riskPolicy       *RiskPolicy
 	snapshotStore    SnapshotStore
 	subscribers      map[int]chan PortfolioEvent
 	nextSubscriberID int
 	lastSnapshot     PortfolioSnapshot
 	hasSnapshot      bool
+	dailyRealizedPnL map[string]float64
 }
 
 // Position represents a trading position
@@ -184,11 +213,12 @@ func NewPortfolio() *Portfolio {
 // NewPortfolioWithOptions creates a portfolio configured by the supplied options.
 func NewPortfolioWithOptions(options ...Option) *Portfolio {
 	p := &Portfolio{
-		balances:     make(map[string]float64),
-		positions:    make(map[string]Position),
-		transactions: []Transaction{},
-		pairParser:   defaultPairParser,
-		subscribers:  make(map[int]chan PortfolioEvent),
+		balances:         make(map[string]float64),
+		positions:        make(map[string]Position),
+		transactions:     []Transaction{},
+		pairParser:       defaultPairParser,
+		subscribers:      make(map[int]chan PortfolioEvent),
+		dailyRealizedPnL: make(map[string]float64),
 	}
 
 	for _, opt := range options {
@@ -220,6 +250,17 @@ func WithFeeSchedule(schedule *FeeSchedule) Option {
 			return
 		}
 		p.feeSchedule = schedule.clone()
+	}
+}
+
+// WithRiskPolicy configures the portfolio with risk limits.
+func WithRiskPolicy(policy *RiskPolicy) Option {
+	return func(p *Portfolio) {
+		if policy == nil {
+			p.riskPolicy = nil
+			return
+		}
+		p.riskPolicy = policy.clone()
 	}
 }
 
@@ -272,6 +313,17 @@ func (p *Portfolio) SetFeeForQuote(quote string, fee float64) {
 	defer p.mu.Unlock()
 	p.ensureFeeSchedule()
 	p.feeSchedule.Quotes[quote] = fee
+}
+
+// SetRiskPolicy updates the risk controls enforced for subsequent transactions.
+func (p *Portfolio) SetRiskPolicy(policy *RiskPolicy) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if policy == nil {
+		p.riskPolicy = nil
+		return
+	}
+	p.riskPolicy = policy.clone()
 }
 
 func (p *Portfolio) ensureFeeSchedule() {
@@ -423,6 +475,11 @@ func (p *Portfolio) AddTransaction(transaction Transaction) error {
 	}
 
 	p.mu.Lock()
+	realizedPnL, err := p.evaluateRiskLocked(transaction)
+	if err != nil {
+		p.mu.Unlock()
+		return err
+	}
 	p.transactions = append(p.transactions, transaction)
 
 	// Update balances and positions based on the transaction
@@ -491,6 +548,14 @@ func (p *Portfolio) AddTransaction(transaction Transaction) error {
 		}
 	}
 
+	if realizedPnL != 0 {
+		if p.dailyRealizedPnL == nil {
+			p.dailyRealizedPnL = make(map[string]float64)
+		}
+		dayKey := transaction.Timestamp.UTC().Format("2006-01-02")
+		p.dailyRealizedPnL[dayKey] += realizedPnL
+	}
+
 	snapshot, diff := p.recordSnapshotLocked()
 	p.mu.Unlock()
 
@@ -507,6 +572,77 @@ func (p *Portfolio) AddTransaction(transaction Transaction) error {
 	})
 
 	return nil
+}
+
+func (p *Portfolio) evaluateRiskLocked(transaction Transaction) (float64, error) {
+	if p.riskPolicy == nil {
+		return 0, nil
+	}
+
+	position := p.positions[transaction.Symbol]
+	projectedQty := position.Quantity
+	switch transaction.Type {
+	case "buy":
+		projectedQty += transaction.Quantity
+	case "sell":
+		projectedQty -= transaction.Quantity
+	}
+
+	if limit, ok := p.riskPolicy.MaxExposureBySymbol[transaction.Symbol]; ok && limit > 0 {
+		if math.Abs(projectedQty) > limit {
+			return 0, fmt.Errorf("risk limit violated: %s exposure %.4f exceeds limit %.4f", transaction.Symbol, math.Abs(projectedQty), limit)
+		}
+	}
+
+	if p.riskPolicy.MaxExposure > 0 {
+		total := 0.0
+		counted := false
+		for symbol, pos := range p.positions {
+			qty := pos.Quantity
+			if symbol == transaction.Symbol {
+				qty = projectedQty
+				counted = true
+			}
+			total += math.Abs(qty)
+		}
+		if !counted {
+			total += math.Abs(projectedQty)
+		}
+		if total > p.riskPolicy.MaxExposure {
+			return 0, fmt.Errorf("risk limit violated: total exposure %.4f exceeds limit %.4f", total, p.riskPolicy.MaxExposure)
+		}
+	}
+
+	realizedPnL := 0.0
+	if p.riskPolicy.DailyLossLimit > 0 && transaction.Type == "sell" {
+		if p.dailyRealizedPnL == nil {
+			p.dailyRealizedPnL = make(map[string]float64)
+		}
+		realizedPnL = projectedRealizedPnL(position, transaction)
+		if realizedPnL < 0 {
+			dayKey := transaction.Timestamp.UTC().Format("2006-01-02")
+			projectedLoss := -(p.dailyRealizedPnL[dayKey] + realizedPnL)
+			if projectedLoss > p.riskPolicy.DailyLossLimit {
+				return 0, fmt.Errorf("risk limit violated: daily losses would reach %.4f exceeding limit %.4f", projectedLoss, p.riskPolicy.DailyLossLimit)
+			}
+		}
+	}
+
+	return realizedPnL, nil
+}
+
+func projectedRealizedPnL(position Position, transaction Transaction) float64 {
+	if transaction.Type != "sell" || transaction.Quantity <= 0 {
+		return 0
+	}
+	if position.Quantity <= 0 {
+		return 0
+	}
+	qtyClosed := math.Min(position.Quantity, transaction.Quantity)
+	if qtyClosed <= 0 {
+		return 0
+	}
+	return (transaction.Price - position.EntryPrice) * qtyClosed
 }
 
 func (p *Portfolio) resolveFee(transaction Transaction, baseAsset, quoteAsset string) (float64, error) {
@@ -769,6 +905,7 @@ func (p *Portfolio) persistSnapshot(snapshot PortfolioSnapshot) error {
 }
 
 func (p *Portfolio) restoreLocked(snapshot PortfolioSnapshot) {
+	p.dailyRealizedPnL = make(map[string]float64)
 	p.balances = make(map[string]float64, len(snapshot.Balances))
 	for _, b := range snapshot.Balances {
 		p.balances[b.Asset] = b.Amount
