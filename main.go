@@ -90,6 +90,29 @@ type PortfolioSnapshot struct {
 	Transactions []Transaction      `json:"transactions"`
 }
 
+// SnapshotDiff captures the mutations between two snapshots so downstream
+// consumers can update their mirrors without reprocessing the entire state.
+type SnapshotDiff struct {
+	Balances             []BalanceChange  `json:"balances,omitempty"`
+	Positions            []PositionChange `json:"positions,omitempty"`
+	TransactionsAppended []Transaction    `json:"transactionsAppended,omitempty"`
+	TransactionsReset    bool             `json:"transactionsReset,omitempty"`
+}
+
+// BalanceChange flags an asset balance that was added/updated/removed.
+type BalanceChange struct {
+	Asset   string  `json:"asset"`
+	Amount  float64 `json:"amount,omitempty"`
+	Deleted bool    `json:"deleted,omitempty"`
+}
+
+// PositionChange reports a position mutation. The snapshot is nil when deleted.
+type PositionChange struct {
+	Symbol   string            `json:"symbol"`
+	Position *PositionSnapshot `json:"position,omitempty"`
+	Deleted  bool              `json:"deleted,omitempty"`
+}
+
 // EventType identifies the kind of portfolio mutation.
 type EventType string
 
@@ -107,6 +130,7 @@ type PortfolioEvent struct {
 	Position    *PositionSnapshot  `json:"position,omitempty"`
 	Transaction *Transaction       `json:"transaction,omitempty"`
 	Snapshot    *PortfolioSnapshot `json:"snapshot,omitempty"`
+	Diff        *SnapshotDiff      `json:"diff,omitempty"`
 	Timestamp   time.Time          `json:"timestamp"`
 	Message     string             `json:"message,omitempty"`
 }
@@ -125,6 +149,8 @@ type Portfolio struct {
 	snapshotStore    SnapshotStore
 	subscribers      map[int]chan PortfolioEvent
 	nextSubscriberID int
+	lastSnapshot     PortfolioSnapshot
+	hasSnapshot      bool
 }
 
 // Position represents a trading position
@@ -299,7 +325,7 @@ func (p *Portfolio) SetBalance(asset string, amount float64) error {
 	p.mu.Lock()
 	p.balances[asset] = amount
 	balanceSnap := BalanceSnapshot{Asset: asset, Amount: amount}
-	snapshot := p.snapshotLocked()
+	snapshot, diff := p.recordSnapshotLocked()
 	p.mu.Unlock()
 
 	if err := p.persistSnapshot(snapshot); err != nil {
@@ -308,6 +334,7 @@ func (p *Portfolio) SetBalance(asset string, amount float64) error {
 	p.publish(PortfolioEvent{
 		Type:      EventBalanceChanged,
 		Balance:   &balanceSnap,
+		Diff:      diff,
 		Timestamp: time.Now(),
 		Message:   fmt.Sprintf("balance for %s set to %f", asset, amount),
 	})
@@ -328,7 +355,7 @@ func (p *Portfolio) UpdatePosition(position Position) error {
 	p.mu.Lock()
 	p.positions[position.Symbol] = position
 	positionSnap := toPositionSnapshot(position)
-	snapshot := p.snapshotLocked()
+	snapshot, diff := p.recordSnapshotLocked()
 	p.mu.Unlock()
 
 	if err := p.persistSnapshot(snapshot); err != nil {
@@ -337,6 +364,7 @@ func (p *Portfolio) UpdatePosition(position Position) error {
 	p.publish(PortfolioEvent{
 		Type:      EventPositionChanged,
 		Position:  &positionSnap,
+		Diff:      diff,
 		Timestamp: time.Now(),
 		Message:   fmt.Sprintf("position %s updated", position.Symbol),
 	})
@@ -355,7 +383,7 @@ func (p *Portfolio) ClosePosition(symbol string) error {
 	delete(p.positions, symbol)
 	position.Quantity = 0
 	position.LastUpdated = time.Now()
-	snapshot := p.snapshotLocked()
+	snapshot, diff := p.recordSnapshotLocked()
 	positionSnap := toPositionSnapshot(position)
 	p.mu.Unlock()
 
@@ -365,6 +393,7 @@ func (p *Portfolio) ClosePosition(symbol string) error {
 	p.publish(PortfolioEvent{
 		Type:      EventPositionChanged,
 		Position:  &positionSnap,
+		Diff:      diff,
 		Timestamp: time.Now(),
 		Message:   fmt.Sprintf("position %s closed", symbol),
 	})
@@ -462,7 +491,7 @@ func (p *Portfolio) AddTransaction(transaction Transaction) error {
 		}
 	}
 
-	snapshot := p.snapshotLocked()
+	snapshot, diff := p.recordSnapshotLocked()
 	p.mu.Unlock()
 
 	if err := p.persistSnapshot(snapshot); err != nil {
@@ -472,6 +501,7 @@ func (p *Portfolio) AddTransaction(transaction Transaction) error {
 	p.publish(PortfolioEvent{
 		Type:        EventTransactionAdded,
 		Transaction: &txCopy,
+		Diff:        diff,
 		Timestamp:   time.Now(),
 		Message:     fmt.Sprintf("transaction %s recorded", transaction.ID),
 	})
@@ -610,13 +640,26 @@ func (p *Portfolio) Snapshot() PortfolioSnapshot {
 // Restore replaces the current in-memory state with the provided snapshot.
 func (p *Portfolio) Restore(snapshot PortfolioSnapshot) {
 	p.mu.Lock()
+	previous := p.lastSnapshot
+	prevValid := p.hasSnapshot
+	snapCopy := cloneSnapshot(snapshot)
 	p.restoreLocked(snapshot)
+	p.lastSnapshot = snapCopy
+	p.hasSnapshot = true
+	var diff *SnapshotDiff
+	base := PortfolioSnapshot{}
+	if prevValid {
+		base = previous
+	}
+	if d := DiffSnapshots(base, snapCopy); !d.IsEmpty() {
+		diff = &d
+	}
 	p.mu.Unlock()
 
-	snapCopy := cloneSnapshot(snapshot)
 	p.publish(PortfolioEvent{
 		Type:      EventPortfolioRestored,
 		Snapshot:  &snapCopy,
+		Diff:      diff,
 		Timestamp: time.Now(),
 		Message:   "portfolio restored from snapshot",
 	})
@@ -703,6 +746,21 @@ func (p *Portfolio) snapshotLocked() PortfolioSnapshot {
 	}
 }
 
+func (p *Portfolio) recordSnapshotLocked() (PortfolioSnapshot, *SnapshotDiff) {
+	snapshot := p.snapshotLocked()
+	base := PortfolioSnapshot{}
+	if p.hasSnapshot {
+		base = p.lastSnapshot
+	}
+	diff := DiffSnapshots(base, snapshot)
+	p.lastSnapshot = snapshot
+	p.hasSnapshot = true
+	if diff.IsEmpty() {
+		return snapshot, nil
+	}
+	return snapshot, &diff
+}
+
 func (p *Portfolio) persistSnapshot(snapshot PortfolioSnapshot) error {
 	if p.snapshotStore == nil {
 		return nil
@@ -744,6 +802,115 @@ func cloneSnapshot(snapshot PortfolioSnapshot) PortfolioSnapshot {
 	copy(clone.Positions, snapshot.Positions)
 	copy(clone.Transactions, snapshot.Transactions)
 	return clone
+}
+
+// DiffSnapshots compares two snapshots and emits the minimal change-set needed to
+// transform prev into next.
+func DiffSnapshots(prev, next PortfolioSnapshot) SnapshotDiff {
+	diff := SnapshotDiff{}
+	prevBalances := make(map[string]float64, len(prev.Balances))
+	for _, b := range prev.Balances {
+		prevBalances[b.Asset] = b.Amount
+	}
+	nextBalances := make(map[string]float64, len(next.Balances))
+	for _, b := range next.Balances {
+		nextBalances[b.Asset] = b.Amount
+		if prevAmount, ok := prevBalances[b.Asset]; !ok || prevAmount != b.Amount {
+			diff.Balances = append(diff.Balances, BalanceChange{Asset: b.Asset, Amount: b.Amount})
+		}
+	}
+	for asset := range prevBalances {
+		if _, ok := nextBalances[asset]; !ok {
+			diff.Balances = append(diff.Balances, BalanceChange{Asset: asset, Deleted: true})
+		}
+	}
+
+	prevPositions := make(map[string]PositionSnapshot, len(prev.Positions))
+	for _, p := range prev.Positions {
+		prevPositions[p.Symbol] = p
+	}
+	nextPositions := make(map[string]PositionSnapshot, len(next.Positions))
+	for _, p := range next.Positions {
+		nextPositions[p.Symbol] = p
+		if prevPos, ok := prevPositions[p.Symbol]; !ok || !positionSnapshotsEqual(prevPos, p) {
+			snapCopy := p
+			diff.Positions = append(diff.Positions, PositionChange{
+				Symbol:   p.Symbol,
+				Position: &snapCopy,
+			})
+		}
+	}
+	for symbol := range prevPositions {
+		if _, ok := nextPositions[symbol]; !ok {
+			diff.Positions = append(diff.Positions, PositionChange{
+				Symbol:  symbol,
+				Deleted: true,
+			})
+		}
+	}
+
+	appendOnly := true
+	minLen := len(prev.Transactions)
+	if len(next.Transactions) < minLen {
+		minLen = len(next.Transactions)
+	}
+	for i := 0; i < minLen; i++ {
+		if !transactionsEqual(prev.Transactions[i], next.Transactions[i]) {
+			appendOnly = false
+			break
+		}
+	}
+	switch {
+	case appendOnly && len(next.Transactions) >= len(prev.Transactions):
+		if len(next.Transactions) > len(prev.Transactions) {
+			appended := copyTransactions(next.Transactions[len(prev.Transactions):])
+			diff.TransactionsAppended = appended
+		}
+	case len(next.Transactions) == 0 && len(prev.Transactions) == 0:
+		// nothing to report
+	default:
+		diff.TransactionsReset = len(next.Transactions) != len(prev.Transactions) || !appendOnly
+		if len(next.Transactions) > 0 {
+			diff.TransactionsAppended = copyTransactions(next.Transactions)
+		}
+	}
+
+	return diff
+}
+
+// IsEmpty reports whether the diff contains any useful information.
+func (d SnapshotDiff) IsEmpty() bool {
+	return len(d.Balances) == 0 && len(d.Positions) == 0 && len(d.TransactionsAppended) == 0 && !d.TransactionsReset
+}
+
+func positionSnapshotsEqual(a, b PositionSnapshot) bool {
+	return a.Symbol == b.Symbol &&
+		a.EntryPrice == b.EntryPrice &&
+		a.CurrentPrice == b.CurrentPrice &&
+		a.Quantity == b.Quantity &&
+		a.OpenTime.Equal(b.OpenTime) &&
+		a.LastUpdated.Equal(b.LastUpdated) &&
+		a.RealizedPnL == b.RealizedPnL &&
+		a.UnrealizedPnL == b.UnrealizedPnL
+}
+
+func transactionsEqual(a, b Transaction) bool {
+	return a.ID == b.ID &&
+		a.Symbol == b.Symbol &&
+		a.Type == b.Type &&
+		a.Quantity == b.Quantity &&
+		a.Price == b.Price &&
+		a.Fee == b.Fee &&
+		a.Timestamp.Equal(b.Timestamp)
+}
+
+func copyTransactions(src []Transaction) []Transaction {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]Transaction, len(src))
+	copy(dst, src)
+	return dst
 }
 
 // JSONFileStore persists snapshots to a local JSON file.

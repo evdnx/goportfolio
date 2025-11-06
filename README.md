@@ -7,6 +7,7 @@
 - Basic position accounting: create, update, close, and inspect positions with realized/unrealized PnL fields for downstream consumers.
 - Transaction ledger: append-only slice that can be copied out for reporting or persistence layers.
 - Balance/position DTO snapshots: `Snapshot`, `BalancesSnapshot`, and `PositionsSnapshot` hand you serialization-ready copies without exposing internal maps.
+- Snapshot diffs: every `PortfolioEvent` carries a `SnapshotDiff` payload so streaming consumers can apply compact balance/position/transaction patches instead of reloading the full state.
 - Configurable pair parsing: pass `WithPairParser` to `NewPortfolioWithOptions` to support venues that do not use the default `BASE/QUOTE` slash format.
 - Fee schedules: describe fees per symbol/base/quote (or default) once and let the portfolio apply them for every transaction.
 - Persistence hooks: plug in JSON, BoltDB, or SQLite stores via `WithSnapshotStore` to automatically persist and rehydrate state between restarts.
@@ -94,11 +95,14 @@ func main() {
 	select {
 	case evt := <-events:
 		fmt.Printf("Event: %s %#v\n", evt.Type, evt.Balance)
+		fmt.Printf("Diff: %#v\n", evt.Diff)
 	case <-time.After(2 * time.Second):
 		fmt.Println("no events received")
 	}
 }
 ```
+
+Inspect the `SnapshotDiff` on every event to fan out only the balances, positions, or transaction slices that actually changed and ignore the rest of the snapshot payloads.
 
 ## Testing
 The project ships with lightweight unit tests that cover transaction handling edge cases. Run them with:
@@ -109,8 +113,7 @@ go test ./...
 ## Roadmap Ideas
 These are intentionally out of scope for the current release, but would make natural extensions:
 1. Risk controls (max exposure, daily loss limits) baked into `AddTransaction` to stop trades that exceed policy.
-2. Snapshot diffs so downstream systems can subscribe to compact change-sets instead of full DTO slices.
-3. Built-in persistence migrations to evolve stored snapshots without forcing manual wipes.
+2. Built-in persistence migrations to evolve stored snapshots without forcing manual wipes.
 
 ## License
 MIT-0

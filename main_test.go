@@ -272,3 +272,80 @@ func TestSubscribeReceivesEvents(t *testing.T) {
 		t.Fatalf("timeout waiting for subscriber channel to close")
 	}
 }
+
+func TestSubscribeEmitsSnapshotDiffs(t *testing.T) {
+	p := NewPortfolio()
+	events, cancel := p.Subscribe(4)
+	t.Cleanup(cancel)
+
+	wait := func() PortfolioEvent {
+		select {
+		case evt := <-events:
+			return evt
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for event")
+		}
+		return PortfolioEvent{}
+	}
+
+	if err := p.SetBalance("USDT", 250); err != nil {
+		t.Fatalf("set balance failed: %v", err)
+	}
+	balEvt := wait()
+	if balEvt.Diff == nil {
+		t.Fatalf("expected diff on balance event")
+	}
+	if len(balEvt.Diff.Balances) != 1 {
+		t.Fatalf("expected single balance diff, got %d", len(balEvt.Diff.Balances))
+	}
+	change := balEvt.Diff.Balances[0]
+	if change.Asset != "USDT" || change.Deleted || change.Amount != 250 {
+		t.Fatalf("unexpected balance diff payload: %+v", change)
+	}
+
+	tx := Transaction{
+		ID:        "diff-tx",
+		Symbol:    "BTC/USDT",
+		Type:      "buy",
+		Quantity:  1,
+		Price:     100,
+		Timestamp: time.Now(),
+	}
+	if err := p.AddTransaction(tx); err != nil {
+		t.Fatalf("add transaction failed: %v", err)
+	}
+	txEvt := wait()
+	if txEvt.Type != EventTransactionAdded {
+		t.Fatalf("unexpected event type %s", txEvt.Type)
+	}
+	if txEvt.Diff == nil {
+		t.Fatalf("expected diff on transaction event")
+	}
+	if txEvt.Diff.TransactionsReset {
+		t.Fatalf("transactions should not be marked as reset for append-only update")
+	}
+	if len(txEvt.Diff.TransactionsAppended) != 1 {
+		t.Fatalf("expected appended transaction, got %d", len(txEvt.Diff.TransactionsAppended))
+	}
+	if txEvt.Diff.TransactionsAppended[0].ID != tx.ID {
+		t.Fatalf("appended transaction mismatch: %+v", txEvt.Diff.TransactionsAppended[0])
+	}
+	if len(txEvt.Diff.Balances) == 0 {
+		t.Fatalf("transaction diff should include balance changes")
+	}
+
+	if err := p.ClosePosition(tx.Symbol); err != nil {
+		t.Fatalf("close position failed: %v", err)
+	}
+	posEvt := wait()
+	if posEvt.Type != EventPositionChanged {
+		t.Fatalf("unexpected event type %s", posEvt.Type)
+	}
+	if posEvt.Diff == nil || len(posEvt.Diff.Positions) != 1 {
+		t.Fatalf("expected single position diff on close, got %#v", posEvt.Diff)
+	}
+	posChange := posEvt.Diff.Positions[0]
+	if posChange.Symbol != tx.Symbol || !posChange.Deleted {
+		t.Fatalf("position diff should mark deletion, got %+v", posChange)
+	}
+}
